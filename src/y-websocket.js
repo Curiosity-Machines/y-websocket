@@ -21,6 +21,12 @@ export const messageSync = 0;
 export const messageQueryAwareness = 3;
 export const messageAwareness = 1;
 export const messageAuth = 2;
+export const messageMultipartChunk = 4;
+export const messageMultipartEnd = 5;
+
+// 1MB threshold for chunking
+// minus 1 byte for the message type and 4 bytes for the chunk size
+const MAX_CHUNK_SIZE = 1024 * 1024 - 1 - 4;
 
 /**
  *                       encoder,          decoder,          provider,          emitSynced, messageType
@@ -94,6 +100,43 @@ messageHandlers[messageAuth] = (
   );
 };
 
+messageHandlers[messageMultipartChunk] = (
+  _encoder,
+  decoder,
+  provider,
+  _emitSynced,
+  _messageType,
+) => {
+  const chunkSize = decoding.readUint32(decoder);
+  const chunk = decoding.readUint8Array(decoder, chunkSize);
+  provider.pendingChunks.push(chunk);
+};
+
+messageHandlers[messageMultipartEnd] = (
+  _encoder,
+  decoder,
+  provider,
+  _emitSynced,
+  _messageType,
+) => {
+  const chunkSize = decoding.readUint32(decoder);
+  const chunk = decoding.readUint8Array(decoder, chunkSize);
+  provider.pendingChunks.push(chunk);
+
+  const combinedEncoder = encoding.createEncoder();
+  provider.pendingChunks.forEach((c) => {
+    encoding.writeUint8Array(combinedEncoder, c);
+  });
+  provider.pendingChunks = [];
+
+  // Re-run the readMessage logic as if it was a single message
+  const combinedBuf = encoding.toUint8Array(combinedEncoder);
+  const tmpEncoder = readMessage(provider, combinedBuf, true);
+  if (encoding.length(tmpEncoder) > 1 && provider.ws) {
+    sendMessageChunked(provider.ws, encoding.toUint8Array(tmpEncoder));
+  }
+};
+
 // @todo - this should depend on awareness.outdatedTime
 const messageReconnectTimeout = 30000;
 
@@ -122,6 +165,33 @@ const readMessage = (provider, buf, emitSynced) => {
   }
   return encoder;
 };
+
+/**
+ * Send a buffer over the WebSocket, splitting into multiple chunks if over MAX_CHUNK_SIZE.
+ * @param {WebSocket} ws
+ * @param {Uint8Array} buf
+ */
+function sendMessageChunked(ws, buf) {
+  if (buf.byteLength <= MAX_CHUNK_SIZE) {
+    ws.send(buf);
+  } else {
+    let offset = 0;
+    while (offset < buf.byteLength) {
+      const end = Math.min(offset + MAX_CHUNK_SIZE, buf.byteLength);
+      const chunkSize = end - offset;
+      const isLast = end === buf.byteLength;
+      const chunkEncoder = encoding.createEncoder();
+      encoding.writeVarUint(
+        chunkEncoder,
+        isLast ? messageMultipartEnd : messageMultipartChunk,
+      );
+      encoding.writeUint32(chunkEncoder, chunkSize);
+      encoding.writeUint8Array(chunkEncoder, buf.subarray(offset, end));
+      ws.send(encoding.toUint8Array(chunkEncoder));
+      offset = end;
+    }
+  }
+}
 
 /**
  * Outsource this function so that a new websocket connection is created immediately.
@@ -185,7 +255,7 @@ const setupWS = (provider) => {
       provider.wsLastMessageReceived = time.getUnixTime();
       const encoder = readMessage(provider, new Uint8Array(event.data), true);
       if (encoding.length(encoder) > 1) {
-        websocket.send(encoding.toUint8Array(encoder));
+        sendMessageChunked(websocket, encoding.toUint8Array(encoder));
       }
     };
     websocket.onerror = (event) => {
@@ -208,7 +278,7 @@ const setupWS = (provider) => {
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, messageSync);
       syncProtocol.writeSyncStep1(encoder, provider.doc);
-      websocket.send(encoding.toUint8Array(encoder));
+      sendMessageChunked(websocket, encoding.toUint8Array(encoder));
       // broadcast local awareness state
       if (provider.awareness.getLocalState() !== null) {
         const encoderAwarenessState = encoding.createEncoder();
@@ -219,7 +289,10 @@ const setupWS = (provider) => {
             provider.doc.clientID,
           ]),
         );
-        websocket.send(encoding.toUint8Array(encoderAwarenessState));
+        sendMessageChunked(
+          websocket,
+          encoding.toUint8Array(encoderAwarenessState),
+        );
       }
     };
     provider.emit("status", [
@@ -237,7 +310,7 @@ const setupWS = (provider) => {
 const broadcastMessage = (provider, buf) => {
   const ws = provider.ws;
   if (provider.wsconnected && ws && ws.readyState === ws.OPEN) {
-    ws.send(buf);
+    sendMessageChunked(ws, new Uint8Array(buf));
   }
   if (provider.bcconnected) {
     bc.publish(provider.bcChannel, buf, provider);
@@ -327,6 +400,8 @@ export class WebsocketProvider extends ObservableV2 {
      */
     this.shouldConnect = connect;
 
+    this.pendingChunks = [];
+
     /**
      * @type {number}
      */
@@ -339,7 +414,7 @@ export class WebsocketProvider extends ObservableV2 {
             const encoder = encoding.createEncoder();
             encoding.writeVarUint(encoder, messageSync);
             syncProtocol.writeSyncStep1(encoder, doc);
-            this.ws.send(encoding.toUint8Array(encoder));
+            sendMessageChunked(this.ws, encoding.toUint8Array(encoder));
           }
         }, resyncInterval)
       );
