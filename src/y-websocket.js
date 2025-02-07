@@ -24,9 +24,9 @@ export const messageAuth = 2;
 export const messageMultipartChunk = 4;
 export const messageMultipartEnd = 5;
 
-// 1MB threshold for chunking
+// 64KB threshold for chunking, 1MB caused issues
 // minus 1 byte for the message type and 4 bytes for the chunk size
-const MAX_CHUNK_SIZE = 1024 * 1024 - 1 - 4;
+const MAX_CHUNK_SIZE = 64 * 1024 - 1 - 4;
 
 /**
  *                       encoder,          decoder,          provider,          emitSynced, messageType
